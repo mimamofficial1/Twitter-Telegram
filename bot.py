@@ -1,187 +1,210 @@
-import os
 import asyncio
-import feedparser
-import aiohttp
+import os
 import logging
-from datetime import datetime, timezone
-from telegram import Bot
-from telegram.error import TelegramError
-from telegram.constants import ParseMode
+import re
+import feedparser
+import telegram
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
+log = logging.getLogger(__name__)
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-TWITTER_USERNAMES  = [u.strip() for u in os.environ["TWITTER_USERNAMES"].split(",")]
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "120"))   # seconds
+def require_env(key):
+    val = os.environ.get(key)
+    if not val:
+        raise EnvironmentError(f"❌ Missing env var: {key}")
+    return val
 
-NITTER_INSTANCES = [
-    "https://nitter.privacyredirect.com",
-    "https://nitter.poast.org",
-    "https://nitter.net",
-    "https://nitter.1d4.us",
-    "https://kavin.rocks",
-    "https://nitter.catsarch.com",
+TELEGRAM_BOT_TOKEN = require_env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = require_env("TELEGRAM_CHAT_ID")
+TWITTER_USERNAMES  = [u.strip().lstrip("@") for u in require_env("TWITTER_USERNAMES").split(",")]
+POLL_INTERVAL      = max(60, int(os.environ.get("POLL_INTERVAL_SECONDS", "120")))
+INCLUDE_RETWEETS   = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "true"
+CUSTOM_PREFIX      = os.environ.get("CUSTOM_PREFIX", "🐦 *New Tweet*")
+
+# xcancel is currently the most stable Nitter instance (99.99% uptime)
+# rss.xcancel.com is their dedicated RSS subdomain
+# Fallbacks included for redundancy
+RSS_INSTANCES = [
+    "https://rss.xcancel.com",       # Most stable — dedicated RSS subdomain
+    "https://xcancel.com",           # Main xcancel instance
+    "https://nitter.poast.org",      # Sometimes works
+    "https://nitter.privacydev.net", # Occasional fallback
 ]
 
-# ─── STATE ─────────────────────────────────────────────────────────────────────
-seen_ids: dict[str, set] = {u: set() for u in TWITTER_USERNAMES}
+# xcancel requires a real browser User-Agent to serve RSS
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
+
+seen_ids: set = set()
+executor = ThreadPoolExecutor(max_workers=10)
 
 
-# ─── HELPERS ───────────────────────────────────────────────────────────────────
-def get_rss_url(instance: str, username: str) -> str:
-    return f"{instance.rstrip('/')}/{username}/rss"
-
-
-def extract_image(entry) -> str | None:
-    """Try to get the first image URL from an RSS entry."""
-    # 1. media_thumbnail
-    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-        return entry.media_thumbnail[0].get("url")
-    # 2. media_content
-    if hasattr(entry, "media_content") and entry.media_content:
-        for m in entry.media_content:
-            if m.get("medium") == "image" or "image" in m.get("type", ""):
-                return m.get("url")
-    # 3. enclosures
-    if hasattr(entry, "enclosures") and entry.enclosures:
-        for enc in entry.enclosures:
-            if "image" in enc.get("type", ""):
-                return enc.get("href") or enc.get("url")
-    # 4. <img> in summary HTML
-    import re
-    summary = getattr(entry, "summary", "") or ""
-    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
-    if match:
-        return match.group(1)
-    return None
-
-
-def clean_summary(summary: str) -> str:
-    """Strip HTML tags from summary."""
-    import re
-    text = re.sub(r"<[^>]+>", "", summary)
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
-    return text.strip()
-
-
-async def fetch_feed(session: aiohttp.ClientSession, username: str) -> feedparser.FeedParserDict | None:
-    """Try each Nitter instance until one works."""
-    for instance in NITTER_INSTANCES:
-        url = get_rss_url(instance, username)
+def _fetch_sync(username: str):
+    import urllib.request
+    last_error = None
+    for instance in RSS_INSTANCES:
+        url = f"{instance}/{username}/rss"
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    content = await resp.text()
-                    feed = feedparser.parse(content)
-                    if feed.entries:
-                        logger.info(f"✅ {username} → {instance} ({len(feed.entries)} entries)")
-                        return feed
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                content = resp.read()
+            feed = feedparser.parse(content)
+            if feed.entries and not feed.bozo:
+                log.info(f"✓ {instance} → @{username} ({len(feed.entries)} entries)")
+                return feed.entries
+            # bozo means parse error / empty
+            last_error = f"Empty or invalid feed from {instance}"
+            log.warning(f"⚠️ {instance} → @{username}: {last_error}")
         except Exception as e:
-            logger.warning(f"⚠️  {instance} failed for @{username}: {e}")
-    logger.error(f"❌ All Nitter instances failed for @{username}")
+            last_error = str(e)
+            log.warning(f"⚠️ {instance} failed for @{username}: {e}")
+    raise Exception(f"All RSS instances failed for @{username}: {last_error}")
+
+
+async def fetch_tweets(username: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, _fetch_sync, username)
+
+
+def extract_image(html: str) -> str | None:
+    """Extract first usable image URL from HTML content."""
+    import urllib.parse
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html)
+    if not match:
+        return None
+    img_url = match.group(1)
+    # Nitter/xcancel proxy URLs: /pic/media%2F... or /pic/pbs.twimg.com%2F...
+    if img_url.startswith("/pic/"):
+        encoded = img_url[5:]
+        decoded = urllib.parse.unquote(encoded)
+        if decoded.startswith("pbs.twimg.com") or decoded.startswith("video.twimg.com"):
+            return "https://" + decoded
+        if decoded.startswith("http"):
+            return decoded
+        return "https://pbs.twimg.com/" + decoded
+    if img_url.startswith("http"):
+        return img_url
     return None
 
 
-async def send_tweet(bot: Bot, entry, username: str):
-    """Send a single tweet as image+caption or text message."""
-    tweet_text = clean_summary(getattr(entry, "summary", ""))
-    tweet_url  = entry.link
-    pub_date   = entry.get("published", "")
+def format_caption(entry, username: str) -> str:
+    """Format tweet as Telegram caption (Markdown)."""
+    summary = entry.get("summary", entry.get("title", ""))
+    summary = re.sub(r'<img[^>]+>', '', summary)
+    summary = re.sub(r'<[^>]+>', '', summary).strip()
+    summary = (summary
+               .replace("&amp;", "&")
+               .replace("&lt;", "<")
+               .replace("&gt;", ">")
+               .replace("&quot;", '"')
+               .replace("&#39;", "'"))
+    summary = re.sub(r'\n{3,}', '\n\n', summary).strip()
 
-    # Try to parse a clean date
+    link = entry.get("link", "")
+    # Normalise to twitter.com link
+    link = re.sub(r"https?://[^/]+/", "https://twitter.com/", link)
+
     try:
-        dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        date_str = dt.strftime("%d %b %Y, %I:%M %p UTC")
+        dt = datetime(*entry.published_parsed[:6])
+        timestamp = dt.strftime("%d %b %Y, %I:%M %p UTC")
     except Exception:
-        date_str = pub_date
+        timestamp = entry.get("published", "")
 
-    caption = (
-        f"🐦 <b>@{username}</b>  •  {date_str}\n\n"
-        f"{tweet_text}\n\n"
-        f"<a href='{tweet_url}'>🔗 View on X</a>"
+    return (
+        f"{CUSTOM_PREFIX}\n\n"
+        f"👤 *@{username}*\n"
+        f"🕐 {timestamp}\n\n"
+        f"{summary}\n\n"
+        f"[View on X ↗]({link})"
     )
 
-    image_url = extract_image(entry)
+
+async def send_to_telegram(entry, username: str):
+    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    caption = format_caption(entry, username)
+    summary_html = entry.get("summary", "")
+    image_url = extract_image(summary_html)
 
     try:
         if image_url:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=image_url,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
-            )
-        logger.info(f"📨 Sent tweet {entry.id} from @{username}")
-    except TelegramError as e:
-        # If image fails, fallback to text
-        logger.warning(f"Image send failed ({e}), falling back to text")
-        try:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=caption,
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError as e2:
-            logger.error(f"❌ Could not send tweet: {e2}")
+            try:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=image_url,
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
+                log.info("✅ Sent with image!")
+                return
+            except Exception as img_err:
+                log.warning(f"⚠️ Image send failed ({img_err}), falling back to text...")
 
-
-# ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
-async def main():
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-    # Announce startup
-    try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                "🤖 <b>Twitter→Telegram Bot started!</b>\n"
-                f"👀 Tracking: {', '.join('@' + u for u in TWITTER_USERNAMES)}\n"
-                f"🔄 Check interval: {CHECK_INTERVAL}s"
-            ),
-            parse_mode=ParseMode.HTML,
+            text=caption,
+            parse_mode="Markdown",
+            disable_web_page_preview=False
         )
-    except TelegramError as e:
-        logger.error(f"Startup message failed: {e}")
+        log.info("✅ Sent as text!")
+    except Exception as e:
+        log.error(f"❌ Telegram error: {e}")
 
-    logger.info(f"Bot started. Watching: {TWITTER_USERNAMES}")
 
-    # Seed seen_ids with current tweets so we don't flood on first run
-    async with aiohttp.ClientSession() as session:
-        for username in TWITTER_USERNAMES:
-            feed = await fetch_feed(session, username)
-            if feed:
-                for entry in feed.entries:
-                    seen_ids[username].add(entry.id)
-        logger.info("Initial seed done. Waiting for new tweets…")
+async def check_user(username: str):
+    try:
+        entries = await fetch_tweets(username)
+        new_count = 0
+        for entry in reversed(entries):
+            uid = entry.get("id") or entry.get("link")
+            if uid in seen_ids:
+                continue
+            if not INCLUDE_RETWEETS and "RT by" in entry.get("title", ""):
+                seen_ids.add(uid)
+                continue
+            await send_to_telegram(entry, username)
+            seen_ids.add(uid)
+            new_count += 1
+            await asyncio.sleep(1)
+        if new_count:
+            log.info(f"📨 @{username}: {new_count} new tweet(s) sent")
+        else:
+            log.info(f"😴 @{username}: no new tweets")
+    except Exception as e:
+        log.error(f"Error (@{username}): {e}")
 
-    # Poll loop
+
+async def run():
+    log.info("🚀 Twitter → Telegram Bot (xcancel RSS mode)")
+    log.info(f"📋 Monitoring: {', '.join(TWITTER_USERNAMES)}")
+    log.info(f"⏱  Poll every {POLL_INTERVAL}s")
+
+    log.info("🌱 Seeding existing tweets (won't re-send on startup)...")
+    seed_results = await asyncio.gather(
+        *[fetch_tweets(u) for u in TWITTER_USERNAMES],
+        return_exceptions=True
+    )
+    for username, result in zip(TWITTER_USERNAMES, seed_results):
+        if isinstance(result, Exception):
+            log.warning(f"⚠️ Seed failed @{username}: {result}")
+        else:
+            for e in result:
+                seen_ids.add(e.get("id") or e.get("link"))
+            log.info(f"✓ @{username} seeded {len(result)} tweet IDs")
+
+    log.info("✅ Watching for NEW tweets!\n")
     while True:
-        await asyncio.sleep(CHECK_INTERVAL)
-        async with aiohttp.ClientSession() as session:
-            for username in TWITTER_USERNAMES:
-                feed = await fetch_feed(session, username)
-                if not feed:
-                    continue
-                new_entries = [e for e in feed.entries if e.id not in seen_ids[username]]
-                # Send oldest first
-                for entry in reversed(new_entries):
-                    await send_tweet(bot, entry, username)
-                    seen_ids[username].add(entry.id)
-                    await asyncio.sleep(2)   # avoid rate limits
+        await asyncio.gather(*[check_user(u) for u in TWITTER_USERNAMES])
+        log.info(f"💤 Sleeping {POLL_INTERVAL}s...")
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())
